@@ -26,6 +26,7 @@ Process {
     $subFolders = Get-ChildItem @dirParams
     $allFolders = @($rootFolder) + $subFolders
 
+    # Collect all unique users/groups (excluding system noise)
     $allUsers = $allFolders | ForEach-Object { 
         (Get-Acl $_.FullName).Access.IdentityReference 
     } | Select-Object -Unique | Where-Object { 
@@ -38,7 +39,8 @@ Process {
         $userRow = [ordered]@{ "User" = $user }
         
         foreach ($folder in $allFolders) {
-            $relativeName = $folder.FullName.Replace($Path, $rootFolder.Name).Replace("\", " - ")
+            # Use Backslash for better clarity in headers
+            $relativeName = $folder.FullName.Replace($Path, $rootFolder.Name)
             
             $acl = Get-Acl $folder.FullName
             $userPerms = $acl.Access | Where-Object { $_.IdentityReference -eq $user }
@@ -60,7 +62,6 @@ Process {
         $results.Add([PSCustomObject]$userRow)
     }
 
-    # Ensure output directory exists (especially if user provided a custom path)
     $outputDir = Split-Path $OutputFile
     if ($outputDir -and !(Test-Path $outputDir)) { 
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null 
