@@ -1,29 +1,30 @@
-# Folder Permissions Analyzer
+# Folder Permissions Matrix (AD Expanded)
 
-This PowerShell script scans a directory and its subfolders to create a permissions matrix. It exports the result to a CSV file.
+This script generates a professional Excel report of folder permissions. It expands Active Directory groups to show individual users and their access levels.
 
 ## Features
 
-- **Mandatory Path**: Requires a target directory for analysis.
-- **Auto-Output**: By default, saves the report in the same folder as the script.
-- **Custom Depth**: Option to limit how deep the script should scan.
-- **Flattened Headers**: Folder hierarchy is displayed as `Root - Folder - SubFolder`.
+- **AD Group Expansion**: Shows real people, not just group names.
+- **Excel Output**: Creates `.xlsx` files with filters and frozen headers.
+- **Path Hierarchy**: Uses `\` in headers for a natural folder structure view.
+- **Write/Read Logic**: Simplifies complex NTFS rights.
 
-## Parameters
+## Prerequisites
 
-- `-Path`: (Mandatory) The full path to the folder to analyze.
-- `-Depth`: (Optional) How many levels of subfolders to include. Default is `-1` (full recursion).
-- `-OutputFile`: (Optional) Custom path for the CSV. Default is `PermissionsReport.csv` in the script's directory.
+Before running the script, you must install the following dependencies:
 
----
+### 1. Active Directory Module (RSAT)
 
-## Examples
+Required to expand groups.
 
-### 1. Default Scan
+- **Windows 10/11**: Settings > Apps > Optional features > Add a feature > "RSAT: Active Directory Domain Services".
+- **Windows Server**: `Install-WindowsFeature RSAT-AD-PowerShell`.
 
-Saves `PermissionsReport.csv` in the current script folder:
+### 2. ImportExcel Module
+
+Required to generate Excel files without Microsoft Office.
+Run this in PowerShell as Administrator:
 
 ```powershell
-.\Scan-ACL.ps1 -Path "C:\Data\Shared"
+Install-Module ImportExcel -Scope CurrentUser
 ```
-"# sacn-acl" 
