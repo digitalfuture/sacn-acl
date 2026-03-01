@@ -1,30 +1,51 @@
-# Folder Permissions Matrix (AD Expanded)
+# NTFSPermissionsReport
 
-This script generates a professional Excel report of folder permissions. It expands Active Directory groups to show individual users and their access levels.
+A PowerShell tool for generating a consolidated Excel matrix of NTFS permissions across multiple root directories with Active Directory group expansion.
 
-## Features
+## Key Features
 
-- **AD Group Expansion**: Shows real people, not just group names.
-- **Excel Output**: Creates `.xlsx` files with filters and frozen headers.
-- **Path Hierarchy**: Uses `\` in headers for a natural folder structure view.
-- **Write/Read Logic**: Simplifies complex NTFS rights.
+- **Multi-Root Support**: Scan multiple paths in one run.
+- **Smart Depth Control**: Set a global depth or override it for specific paths using `Path:Depth` syntax.
+- **DACL Fingerprinting**: Automatically hides folders that inherit permissions without changes (ignores Owner/Technical noise).
+- **AD Group Expansion**: Recursively expands AD groups to show individual user access.
+- **Excel Matrix**: Color-coded output (Green=Write, Blue=Read, Red=No Access) with left-aligned formatting.
 
 ## Prerequisites
 
-Before running the script, you must install the following dependencies:
+1. **PowerShell 5.1+**
+2. **ImportExcel Module**: `Install-Module ImportExcel`
+3. **RSAT (Active Directory)**: Required for group expansion. If missing, the script will fallback to raw identity names.
 
-### 1. Active Directory Module (RSAT)
+## Usage
 
-Required to expand groups.
+### Basic Command
 
-- **Windows 10/11**: Settings > Apps > Optional features > Add a feature > "RSAT: Active Directory Domain Services".
-- **Windows Server**: `Install-WindowsFeature RSAT-AD-PowerShell`.
-
-### 2. ImportExcel Module
-
-Required to generate Excel files without Microsoft Office.
-Run this in PowerShell as Administrator:
+Run the script and provide target paths. You can specify depth for each path individually.
 
 ```powershell
-Install-Module ImportExcel -Scope CurrentUser
+.\Scan-ACL.ps1 -TargetPaths "C:\Projects", "D:\Archive:2", "\\Server\Share:1"
 ```
+
+## Parameters
+
+- **TargetPaths**: (Required) Array of strings. Syntax: Path or Path:Depth.
+
+- **GlobalDepth**: (Optional) Default depth for paths without a specific limit. Default is 100.
+
+- **OutputFile**: (Optional) Custom path for the resulting .xlsx file.
+
+## Examples
+
+Global depth with overrides:
+
+```powershell
+.\Scan-ACL.ps1 -TargetPaths "C:\Data:1", "D:\Backups" -GlobalDepth 5
+```
+
+### Output Legend
+
+- **W (Light Green)**: Full Control, Modify, or Write permissions.
+
+- **R (Light Blue)**: Read-only permissions.
+
+- **(Light Red)**: No permissions detected for the user on this specific folder.

@@ -1,12 +1,9 @@
 ﻿[CmdletBinding()]
 Param(
     [Parameter(Mandatory=$true, Position=0)]
-    [ValidateScript({Test-Path $_ -PathType Container})]
-    [string]$Path,
-
+    [string[]]$TargetPaths,
     [Parameter(Mandatory=$false)]
-    [int]$Depth = 100,
-
+    [int]$GlobalDepth = 100,
     [Parameter(Mandatory=$false)]
     [string]$OutputFile = "$PSScriptRoot\PermissionsReport.xlsx"
 )
@@ -16,161 +13,161 @@ process {
     Import-Module ImportExcel
     Add-Type -AssemblyName System.Drawing
 
-    # AD Module Check
     $adAvailable = Get-Module -ListAvailable ActiveDirectory
     if ($adAvailable) { try { Import-Module ActiveDirectory -ErrorAction SilentlyContinue } catch { $adAvailable = $false } }
-
     $groupCache = @{}
-
-    # Helper to get a normalized "fingerprint" of permissions
-    function Get-PermissionFingerprint ($acl) {
-        # Extract only non-system identities and their rights, then sort them
-        $entries = $acl.Access | Where-Object { $_.IdentityReference -notmatch "SYSTEM|NT AUTHORITY|BUILTIN" } | ForEach-Object {
-            "$($_.IdentityReference.Value):$($_.FileSystemRights.ToString())"
-        } | Sort-Object
-        return ($entries -join ";")
-    }
 
     function Get-Members ($identityName) {
         if (!$adAvailable) { return @($identityName) }
         if ($groupCache.ContainsKey($identityName)) { return $groupCache[$identityName] }
         try {
-            $adObj = Get-ADObject -Filter "SamAccountName -eq '$identityName'" -ErrorAction SilentlyContinue
-            if ($null -ne $adObj -and $adObj.ObjectClass -eq "group") {
+            $obj = Get-ADObject -Filter "SamAccountName -eq '$identityName'" -ErrorAction SilentlyContinue
+            if ($null -ne $obj -and $obj.ObjectClass -eq "group") {
                 $m = Get-ADGroupMember -Identity $identityName -Recursive | Select-Object -ExpandProperty SamAccountName
-                $groupCache[$identityName] = $m
-                return $m
+                $groupCache[$identityName] = $m; return $m
             }
         } catch {}
         return @($identityName)
     }
 
-    # 1. SCANNING (Fingerprint comparison)
-    Write-Host ">>> Step 1: Scanning for unique permission sets..." -ForegroundColor Cyan
-    $root = Get-Item $Path
-    $folderList = New-Object System.Collections.Generic.List[PSObject]
-    $folderList.Add($root)
+    $rawFolderList = New-Object System.Collections.Generic.List[PSObject]
+    $rootMap = @{}
 
-    $allDirs = Get-ChildItem -Path $Path -Directory -Recurse -Depth ($Depth - 1) -ErrorAction SilentlyContinue
-    
-    foreach ($dir in $allDirs) {
-        $currentAcl = Get-Acl $dir.FullName
-        $parentAcl = Get-Acl (Split-Path $dir.FullName -Parent)
+    foreach ($entry in $TargetPaths) {
+        $path = $entry; $depth = $GlobalDepth
+        if ($entry -match "(.+):(\d+)$") { $path = $Matches[1]; $depth = [int]$Matches[2] }
+        if (!(Test-Path $path)) { continue }
         
-        $currentFingerprint = Get-PermissionFingerprint $currentAcl
-        $parentFingerprint = Get-PermissionFingerprint $parentAcl
+        $rootItem = Get-Item $path
+        $rawFolderList.Add($rootItem)
+        $rootMap[$rootItem.FullName] = $rootItem.FullName
 
-        # Only add if the actual user/rights set is different from parent
-        if ($currentFingerprint -ne $parentFingerprint) {
-            $folderList.Add($dir)
+        $subDirs = Get-ChildItem -Path $path -Directory -Recurse -Depth ($depth - 1) -ErrorAction SilentlyContinue
+        foreach ($dir in $subDirs) {
+            try {
+                $cACL = Get-Acl $dir.FullName; $pACL = Get-Acl (Split-Path $dir.FullName -Parent)
+                $f1 = ($cACL.Access | Where-Object {$_.IdentityReference -notmatch "SYSTEM|NT AUTHORITY|BUILTIN"} | ForEach-Object {"$($_.IdentityReference.Value):$($_.FileSystemRights)"} | Sort-Object) -join ";"
+                $f2 = ($pACL.Access | Where-Object {$_.IdentityReference -notmatch "SYSTEM|NT AUTHORITY|BUILTIN"} | ForEach-Object {"$($_.IdentityReference.Value):$($_.FileSystemRights)"} | Sort-Object) -join ";"
+                if ($f1 -ne $f2) { $rawFolderList.Add($dir); $rootMap[$dir.FullName] = $rootItem.FullName }
+            } catch {}
         }
     }
 
-    # 2. DATA COLLECTION
-    $userMap = @{} 
-    $rightsMap = @{} 
-
-    Write-Host ">>> Step 2: Processing users..." -ForegroundColor Cyan
-    foreach ($f in $folderList) {
-        $acl = Get-Acl $f.FullName
-        foreach ($acc in $acl.Access) {
-            $identity = $acc.IdentityReference.Value
-            if ($identity -match "SYSTEM|NT AUTHORITY|BUILTIN") { continue }
-            $rawName = if ($identity -match "\\") { $identity.Split('\')[-1] } else { $identity }
-            $rights = if ($acc.FileSystemRights.ToString() -match "FullControl|Modify|Write") { "W" } else { "R" }
-
-            $members = Get-Members $rawName
-            foreach ($m in $members) {
-                if ($null -eq $m) { continue }
-                if (!$userMap.ContainsKey($m)) {
-                    $dName = $m
-                    if ($adAvailable) {
-                        try {
-                            $user = Get-ADUser -Identity $m -Properties DisplayName -ErrorAction SilentlyContinue
-                            if ($user.DisplayName) { $dName = $user.DisplayName }
-                        } catch {}
+    $allFolderList = $rawFolderList | Sort-Object FullName
+    $userMap = @{} ; $rightsMap = @{} 
+    foreach ($f in $allFolderList) {
+        try {
+            $acl = Get-Acl $f.FullName
+            foreach ($acc in $acl.Access) {
+                $identity = $acc.IdentityReference.Value
+                if ($identity -match "SYSTEM|NT AUTHORITY|BUILTIN") { continue }
+                $raw = $identity.Split('\')[-1]
+                $rights = if ($acc.FileSystemRights.ToString() -match "FullControl|Modify|Write") { "W" } else { "R" }
+                foreach ($m in (Get-Members $raw)) {
+                    if (!$userMap.ContainsKey($m)) {
+                        $dn = $m; if ($adAvailable) { try { $u = Get-ADUser $m; $dn = $u.Name } catch {} }
+                        $userMap[$m] = [PSCustomObject]@{FullName=$dn; Login=$m}
                     }
-                    $userMap[$m] = [PSCustomObject]@{ FullName = $dName; Login = $m }
+                    $key = "$m|$($f.FullName)"
+                    if ($rightsMap[$key] -ne "W") { $rightsMap[$key] = $rights }
                 }
-                $key = "$m|$($f.FullName)"
-                if ($rightsMap[$key] -ne "W") { $rightsMap[$key] = $rights }
             }
-        }
+        } catch {}
     }
 
-    # 3. EXCEL CONSTRUCTION
     $excel = New-Object OfficeOpenXml.ExcelPackage
     $ws = $excel.Workbook.Worksheets.Add("Permissions")
-    $sortedLogins = $userMap.Keys | Sort-Object
-    $baseLen = $root.Parent.FullName.Length
-    $maxH = ($folderList | ForEach-Object { ($_.FullName.Substring($baseLen).TrimStart('\').Split('\')).Count } | Measure-Object -Maximum).Maximum
-    if ($maxH -lt 2) { $maxH = 2 }
-
-    for ($c = 0; $c -lt $folderList.Count; $c++) {
-        $col = $c + 3
-        $fPath = $folderList[$c].FullName
-        $parts = $fPath.Substring($baseLen).TrimStart('\').Split('\')
-        for ($i = 0; $i -lt $parts.Count; $i++) { $ws.SetValue(($i + 1), $col, $parts[$i]) }
-
-        for ($u = 0; $u -lt $sortedLogins.Count; $u++) {
-            $row = $maxH + 1 + $u
-            $login = $sortedLogins[$u]
-            if ($c -eq 0) {
-                $ws.SetValue($row, 1, $userMap[$login].FullName)
-                $ws.SetValue($row, 2, $userMap[$login].Login)
-            }
-            $val = if ($rightsMap["$login|$fPath"]) { $rightsMap["$login|$fPath"] } else { "-" }
-            $ws.SetValue($row, $col, $val)
-            
-            $cell = $ws.Cells[$row, $col]
-            $cell.Style.Fill.PatternType = 'Solid'
-            if ($val -eq "W") { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGreen) }
-            elseif ($val -eq "R") { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightSkyBlue) }
-            else { 
-                $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::FromArgb(255, 199, 206))
-                $cell.Style.Font.Color.SetColor([System.Drawing.Color]::DarkRed)
-            }
-        }
-    }
-
-    # 4. FORMATTING
-    $totalR = $maxH + $sortedLogins.Count
-    $totalC = $folderList.Count + 2
-    $allRange = $ws.Cells[1, 1, $totalR, $totalC]
-
-    $allRange.Style.Border.Top.Style = $allRange.Style.Border.Bottom.Style = 'Thin'
-    $allRange.Style.Border.Left.Style = $allRange.Style.Border.Right.Style = 'Thin'
-    $allRange.Style.HorizontalAlignment = 'Left'
-    $allRange.Style.VerticalAlignment = 'Center'
-    $allRange.Style.Indent = 1
-
-    $userHdr = $ws.Cells[1, 1, $maxH, 2]
-    $userHdr.Style.Fill.PatternType = 'Solid'
-    $userHdr.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::SlateGray)
-    $userHdr.Style.Font.Color.SetColor([System.Drawing.Color]::White)
+    $logins = $userMap.Keys | Sort-Object
     
-    $ws.Cells[1, 1, $maxH, 1].Merge = $true; $ws.Cells[1, 1].Value = "Full Name"
-    $ws.Cells[1, 2, $maxH, 2].Merge = $true; $ws.Cells[1, 2].Value = "Login"
-    $ws.Cells[1, 3, $maxH, 3].Merge = $true
+    $maxH = 1
+    foreach ($f in $allFolderList) {
+        $rel = $f.FullName.Replace($rootMap[$f.FullName], "").TrimStart('\')
+        $d = if ($rel -eq "") { 1 } else { ($rel.Split('\')).Count + 1 }
+        if ($d -gt $maxH) { $maxH = $d }
+    }
 
-    for ($r = 1; $r -le $maxH; $r++) {
-        for ($c = 4; $c -le ($folderList.Count + 2); $c++) {
-            $v = $ws.GetValue($r, $c); if (!$v) { continue }
-            $s = $c
-            while ($c + 1 -le ($folderList.Count + 2) -and $ws.GetValue($r, $c + 1) -eq $v) { $c++ }
-            if ($c -gt $s) { $ws.Cells[$r, $s, $r, $c].Merge = $true }
+    for ($c = 0; $c -lt $allFolderList.Count; $c++) {
+        $col = $c + 3; $f = $allFolderList[$c]; $root = $rootMap[$f.FullName]
+        $ws.SetValue(1, $col, $root)
+        $rel = $f.FullName.Replace($root, "").TrimStart('\')
+        if ($rel -ne "") {
+            $parts = $rel.Split('\')
+            for ($p = 0; $p -lt $parts.Count; $p++) { $ws.SetValue(($p + 2), $col, $parts[$p]) }
+        }
+        for ($u = 0; $u -lt $logins.Count; $u++) {
+            $row = $maxH + 1 + $u; $login = $logins[$u]
+            if ($c -eq 0) { 
+                $ws.SetValue($row, 1, $userMap[$login].FullName); $ws.SetValue($row, 2, $userMap[$login].Login)
+            }
+            $v = if ($rightsMap["$login|$($f.FullName)"]) { $rightsMap["$login|$($f.FullName)"] } else { "-" }
+            $ws.SetValue($row, $col, $v)
+            $cell = $ws.Cells[$row, $col]; $cell.Style.Fill.PatternType = 'Solid'
+            switch ($v) {
+                "W" { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGreen) }
+                "R" { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightSkyBlue) }
+                default { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::FromArgb(255, 199, 206)) }
+            }
+            $cell.Style.HorizontalAlignment = 'Center'
         }
     }
 
-    $folderHdrArea = $ws.Cells[1, 3, $maxH, $totalC]
-    $folderHdrArea.Style.Fill.PatternType = 'Solid'
-    $folderHdrArea.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGray)
-    $ws.Cells[1, 1, $maxH, $totalC].Style.Font.Bold = $true
+    $totalC = $allFolderList.Count + 2
 
-    $ws.Cells.AutoFitColumns()
+    # --- FINAL HYBRID MERGE LOGIC ---
+
+    # 1. Горизонтальное объединение (создаем блоки)
+    for ($r = 1; $r -le $maxH; $r++) {
+        for ($c = 3; $c -lt $totalC; $c++) {
+            $v1 = $ws.GetValue($r, $c)
+            if ($null -eq $v1) { continue }
+            $startCol = $c
+            while ($c + 1 -le $totalC -and $ws.GetValue($r, $c + 1) -eq $v1) {
+                if ($r -gt 1 -and $ws.GetValue($r - 1, $startCol) -ne $ws.GetValue($r - 1, $c + 1)) { break }
+                $c++
+            }
+            if ($c -gt $startCol) { try { $ws.Cells[$r, $startCol, $r, $c].Merge = $true } catch {} }
+        }
+    }
+
+    # 2. Вертикальное объединение (растягиваем блоки вниз)
+    # Сначала Full Name / Login
+    $ws.Cells[1,1,$maxH,1].Merge = $true; $ws.Cells[1,1].Value = "Full Name"
+    $ws.Cells[1,2,$maxH,2].Merge = $true; $ws.Cells[1,2].Value = "Login"
+
+    # Теперь папки
+    for ($col = 3; $col -le $totalC; $col++) {
+        for ($row = 1; $row -le $maxH; $row++) {
+            $val = $ws.GetValue($row, $col)
+            if ($null -ne $val) {
+                $startR = $row
+                $nextR = $row + 1
+                # Ищем пустые ячейки строго под этой
+                while ($nextR -le $maxH -and $null -eq $ws.GetValue($nextR, $col)) {
+                    $nextR++
+                }
+                if ($nextR - 1 -gt $startR) {
+                    # Пытаемся объединить. Если ячейка уже в горизонтальном мерже, 
+                    # EPPlus корректно расширит область.
+                    try { $ws.Cells[$startR, $col, $nextR - 1, $col].Merge = $true } catch {}
+                }
+                $row = $nextR - 1
+            }
+        }
+    }
+
+    # Styles
+    $fullRange = $ws.Cells[1, 1, ($maxH + $logins.Count), $totalC]
+    $fullRange.Style.VerticalAlignment = 'Center'
+    $fullRange.Style.Border.Top.Style = $fullRange.Style.Border.Bottom.Style = $fullRange.Style.Border.Left.Style = $fullRange.Style.Border.Right.Style = 'Thin'
+    $ws.Cells[1, 1, $maxH, $totalC].Style.Fill.PatternType = 'Solid'
+    $ws.Cells[1, 1, $maxH, $totalC].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGray)
+    $ws.Cells[1, 1, $maxH, $totalC].Style.Font.Bold = $true
+    $ws.Cells[1, 1, $maxH, $totalC].Style.HorizontalAlignment = 'Left'
+    $ws.Cells[($maxH + 1), 1, ($maxH + $logins.Count), 2].Style.HorizontalAlignment = 'Left'
+    
+    $ws.Cells.AutoFitColumns(12, 60)
 
     if (Test-Path $OutputFile) { Remove-Item $OutputFile -Force }
-    $excel.SaveAs($OutputFile)
-    $excel.Dispose()
-    Write-Host "`n>>> Success! Duplicate permission sets removed." -ForegroundColor Green
+    $excel.SaveAs($OutputFile); $excel.Dispose()
+    Write-Host "`n>>> Done! Hybrid Merge (H then V) applied." -ForegroundColor Green
 }
