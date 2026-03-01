@@ -22,6 +22,15 @@ process {
 
     $groupCache = @{}
 
+    # Helper to get a normalized "fingerprint" of permissions
+    function Get-PermissionFingerprint ($acl) {
+        # Extract only non-system identities and their rights, then sort them
+        $entries = $acl.Access | Where-Object { $_.IdentityReference -notmatch "SYSTEM|NT AUTHORITY|BUILTIN" } | ForEach-Object {
+            "$($_.IdentityReference.Value):$($_.FileSystemRights.ToString())"
+        } | Sort-Object
+        return ($entries -join ";")
+    }
+
     function Get-Members ($identityName) {
         if (!$adAvailable) { return @($identityName) }
         if ($groupCache.ContainsKey($identityName)) { return $groupCache[$identityName] }
@@ -36,8 +45,8 @@ process {
         return @($identityName)
     }
 
-    # 1. SCANNING (DACL-only filter)
-    Write-Host ">>> Step 1: Scanning folders..." -ForegroundColor Cyan
+    # 1. SCANNING (Fingerprint comparison)
+    Write-Host ">>> Step 1: Scanning for unique permission sets..." -ForegroundColor Cyan
     $root = Get-Item $Path
     $folderList = New-Object System.Collections.Generic.List[PSObject]
     $folderList.Add($root)
@@ -47,8 +56,12 @@ process {
     foreach ($dir in $allDirs) {
         $currentAcl = Get-Acl $dir.FullName
         $parentAcl = Get-Acl (Split-Path $dir.FullName -Parent)
-        # Compare only DACL strings to avoid noise from Owner changes
-        if ($currentAcl.AccessToString -ne $parentAcl.AccessToString) {
+        
+        $currentFingerprint = Get-PermissionFingerprint $currentAcl
+        $parentFingerprint = Get-PermissionFingerprint $parentAcl
+
+        # Only add if the actual user/rights set is different from parent
+        if ($currentFingerprint -ne $parentFingerprint) {
             $folderList.Add($dir)
         }
     }
@@ -57,7 +70,7 @@ process {
     $userMap = @{} 
     $rightsMap = @{} 
 
-    Write-Host ">>> Step 2: Processing users and AD names..." -ForegroundColor Cyan
+    Write-Host ">>> Step 2: Processing users..." -ForegroundColor Cyan
     foreach ($f in $folderList) {
         $acl = Get-Acl $f.FullName
         foreach ($acc in $acl.Access) {
@@ -120,19 +133,17 @@ process {
         }
     }
 
-    # 4. FORMATTING & ALIGNMENT
+    # 4. FORMATTING
     $totalR = $maxH + $sortedLogins.Count
     $totalC = $folderList.Count + 2
     $allRange = $ws.Cells[1, 1, $totalR, $totalC]
 
-    # Global Borders and LEFT alignment
     $allRange.Style.Border.Top.Style = $allRange.Style.Border.Bottom.Style = 'Thin'
     $allRange.Style.Border.Left.Style = $allRange.Style.Border.Right.Style = 'Thin'
     $allRange.Style.HorizontalAlignment = 'Left'
     $allRange.Style.VerticalAlignment = 'Center'
     $allRange.Style.Indent = 1
 
-    # User Headers Style
     $userHdr = $ws.Cells[1, 1, $maxH, 2]
     $userHdr.Style.Fill.PatternType = 'Solid'
     $userHdr.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::SlateGray)
@@ -142,7 +153,6 @@ process {
     $ws.Cells[1, 2, $maxH, 2].Merge = $true; $ws.Cells[1, 2].Value = "Login"
     $ws.Cells[1, 3, $maxH, 3].Merge = $true
 
-    # Folder Header Merging
     for ($r = 1; $r -le $maxH; $r++) {
         for ($c = 4; $c -le ($folderList.Count + 2); $c++) {
             $v = $ws.GetValue($r, $c); if (!$v) { continue }
@@ -152,7 +162,6 @@ process {
         }
     }
 
-    # Folder Headers Style
     $folderHdrArea = $ws.Cells[1, 3, $maxH, $totalC]
     $folderHdrArea.Style.Fill.PatternType = 'Solid'
     $folderHdrArea.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGray)
@@ -163,5 +172,5 @@ process {
     if (Test-Path $OutputFile) { Remove-Item $OutputFile -Force }
     $excel.SaveAs($OutputFile)
     $excel.Dispose()
-    Write-Host "`n>>> Success! Report generated in English. Path: $OutputFile" -ForegroundColor Green
+    Write-Host "`n>>> Success! Duplicate permission sets removed." -ForegroundColor Green
 }
